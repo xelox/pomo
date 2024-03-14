@@ -11,7 +11,7 @@ use colored::Colorize;
 use rodio::{Decoder, OutputStream, Sink, Source};
 
 
-fn format_time (t: u32) -> String {
+fn format_time (t: u128) -> String {
     let seconds = t / 1000;
     let mins = seconds / 60;
     let milis = (t - seconds * 1000) * 10 / 100;
@@ -25,6 +25,41 @@ fn format_time (t: u32) -> String {
     }
 }
 
+#[derive(Debug)]
+struct Statistics {
+    focus_time: u128,
+    break_time: u128,
+    paused_time: u128,
+    extra_focus_time: u128,
+    extra_break_time: u128,
+    completed_cycles: u128,
+}
+ 
+impl Statistics {
+    fn new() -> Statistics {
+        Statistics {
+            focus_time: 0,
+            break_time: 0,
+            paused_time: 0,
+            extra_focus_time: 0,
+            extra_break_time: 0,
+            completed_cycles: 0
+        }
+    }
+
+    fn print(&self) {
+        let esc_char = 27 as char;
+        println!("{esc_char}[2J");
+        println!("{esc_char}[1;1H> Focus:       {}", format_time(self.focus_time).green());
+        println!("{esc_char}[2;1H> Break:       {}", format_time(self.break_time).red());
+        println!("{esc_char}[3;1H> Extra Focus: {}", format_time(self.extra_focus_time).purple());
+        println!("{esc_char}[4;1H> Extra Break: {}", format_time(self.extra_break_time).magenta());
+        println!("{esc_char}[5;1H> Paused:      {}", format_time(self.paused_time).blue());
+        println!("{esc_char}[6;1H> Cycles:      {}", format!("{}", self.completed_cycles).white());
+        println!("{esc_char}[6;1H");
+    }
+}
+
 #[derive(PartialEq)]
 enum PomodoroState {
     Idle,
@@ -34,6 +69,9 @@ enum PomodoroState {
 } 
 
 fn main() {
+    let _stdout = io::stdout().into_raw_mode().unwrap();
+    let mut stdin = termion::async_stdin().keys();
+
     let esc_char = 27 as char;
     let idle_instruction = format!("Press ({}) to start focusing, ({}) to quit.{esc_char}[1;1H", "S".green(), "Q".red());
     let running_instruction = format!("Press ({}) to pause, ({}) stop ({}) to quit.{esc_char}[1;1H", "S".yellow(), "E".purple(), "Q".red());
@@ -48,32 +86,39 @@ fn main() {
     let audio_source_motiv = Decoder::new(audio_file_motiv).unwrap().repeat_infinite().buffered();
     let audio_source_break = Decoder::new(audio_file_break).unwrap().repeat_infinite().buffered();
 
-    let _stdout = io::stdout().into_raw_mode().unwrap();
-    let mut stdin = termion::async_stdin().keys();
-
     let mut remaining_time: i32 = 0;
-
     //states: Focus / Short Break / Long Break
-    let state_cycle_word = ["Focus", "Short Break", "Focus", "Short Break", "Focus", "Short Break", "Focus", "Long Break"];
-    let state_cycle_time = [30, 10, 30, 10, 30, 10, 30, 30];
-
-    let mut current_state_idx = 0;
+    let phase_cycle = [
+        ("Focus", 30),
+        ("Short Break", 10),
+        ("Focus", 30),
+        ("Short Break", 10),
+        ("Focus", 30),
+        ("Long Break", 30),
+    ];
+    let mut current_phase_idx = 0;
     let mut pomo_state = PomodoroState::Idle;
+
+    let mut stats = Statistics::new();
+
     let mut t = Instant::now();
     loop {
-        let elapsed_in_loop = t.elapsed().as_millis() as u32;
+        let elapsed_in_loop = t.elapsed().as_millis() as u128;
         t = Instant::now();
 
         let input = stdin.next();
         if let Some(Ok(key)) = input {
             match key {
-                termion::event::Key::Char('q') => break,
+                termion::event::Key::Char('q') => { 
+                    stats.print();
+                    break;
+                }
                 termion::event::Key::Char('s') => {
                     match pomo_state {
                         PomodoroState::Idle => {
                             pomo_state = PomodoroState::Running;
                             instruction = running_instruction.clone();
-                            remaining_time = state_cycle_time[current_state_idx] * 1000 * 60;
+                            remaining_time = phase_cycle[current_phase_idx].1 * 1000 * 60;
                             sink.skip_one();
                         }
                         PomodoroState::Paused => {
@@ -94,12 +139,13 @@ fn main() {
                 termion::event::Key::Char('c') => {
                     if pomo_state == PomodoroState::PendingContinueInput {
                         pomo_state = PomodoroState::Running;
-                        current_state_idx += 1;
-                        if current_state_idx == state_cycle_time.len() {
-                            current_state_idx = 0;
+                        current_phase_idx += 1;
+                        if current_phase_idx == phase_cycle.len() {
+                            current_phase_idx = 0;
+                            stats.completed_cycles += 1;
                         }
                         instruction = running_instruction.clone();
-                        remaining_time = state_cycle_time[current_state_idx] * 1000 * 60;
+                        remaining_time = phase_cycle[current_phase_idx].1 * 1000 * 60;
                         sink.skip_one();
                     }
                 },
@@ -119,42 +165,54 @@ fn main() {
         if pomo_state != PomodoroState::Idle && pomo_state != PomodoroState::Paused {
             // clock is ticking...
             remaining_time -= elapsed_in_loop as i32;
+            let (current_phase_str, _) = phase_cycle[current_phase_idx];
+
+            if current_phase_str == "Focus" {
+                stats.focus_time += elapsed_in_loop as u128;
+            } else {
+                stats.break_time += elapsed_in_loop as u128;
+            }
 
             let sign = if remaining_time < 0 { "+" } else { "-" };
-            let duration_str = sign.to_owned() + &format_time(remaining_time.abs() as u32);
+            let duration_str = sign.to_owned() + &format_time(remaining_time.abs() as u128);
             let mut colored_duration_str = duration_str.green();
 
             if remaining_time < 0 {
                 // changing state, playing sound.
                 if pomo_state != PomodoroState::PendingContinueInput {
                     pomo_state = PomodoroState::PendingContinueInput;
-                    let sound_to_play = if current_state_idx % 2 != 0 {
+                    let sound_to_play = if current_phase_idx % 2 != 0 {
                         audio_source_motiv.clone()
                     } else {
                         audio_source_break.clone()
                     };
                     sink.append(sound_to_play);
                 }
+                if current_phase_str == "Focus" {
+                    stats.extra_focus_time += elapsed_in_loop as u128;
+                } else {
+                    stats.extra_break_time += elapsed_in_loop as u128;
+                }
                 instruction = continue_instruction.clone();
                 colored_duration_str = duration_str.red();
             }
 
 
-            let current_state_str = state_cycle_word[current_state_idx];
-            println!("{esc_char}[2;1H{colored_duration_str} {current_state_str}{esc_char}[2;1H");
+            println!("{esc_char}[2;1H{colored_duration_str} {current_phase_str}{esc_char}[2;1H");
         }
 
         if pomo_state == PomodoroState::Paused {
+            stats.paused_time += elapsed_in_loop as u128;
             // Clock is still, just print to screen.
             let sign = if remaining_time < 0 { "+" } else { "-" };
-            let duration_str = sign.to_owned() + &format_time(remaining_time.abs() as u32);
+            let duration_str = sign.to_owned() + &format_time(remaining_time.abs() as u128);
             let mut colored_duration_str = duration_str.green();
             if remaining_time < 0 {
                 colored_duration_str = duration_str.red();
             }
 
-            let current_state_str = state_cycle_word[current_state_idx];
-            println!("{esc_char}[2;1H{colored_duration_str} {current_state_str}{esc_char}[2;1H");
+            let (current_phase_str, _) = phase_cycle[current_phase_idx];
+            println!("{esc_char}[2;1H{colored_duration_str} {current_phase_str}{esc_char}[2;1H");
         }
 
         sleep(Duration::from_millis(10));
