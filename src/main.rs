@@ -12,16 +12,28 @@ use rodio::{Decoder, OutputStream, Sink, Source};
 
 
 fn format_time (t: u128) -> String {
-    let seconds = t / 1000;
-    let mins = seconds / 60;
+    let mut seconds = t / 1000;
+    let mut mins = seconds / 60;
+    let hours = mins / 60;
     let milis = (t - seconds * 1000) * 10 / 100;
 
-    if mins > 0 {
-        let display_secs = seconds - mins * 60;
-        format!("{:02}:{:02}.{:02}", mins, display_secs, milis)
+    seconds -= mins * 60;
+    mins -= hours * 60;
+
+    if hours > 0 {
+        format!("{:02}:{:02}:{:02}.{:02}", hours, mins, seconds, milis)
     }
-    else {
+    else if mins > 0 {
+        format!("{:02}:{:02}.{:02}", mins, seconds, milis)
+    }
+    else if seconds > 0 {
         format!("{:02}.{:02}s", seconds, milis)
+    }
+    else if milis > 0 {
+        format!("{t}ms")
+    }
+    else { 
+        "0".red().strikethrough().to_string()
     }
 }
 
@@ -29,6 +41,8 @@ fn format_time (t: u128) -> String {
 struct Statistics {
     focus_time: u128,
     break_time: u128,
+    skipped_focus_time: u128,
+    skipped_break_time: u128,
     paused_time: u128,
     extra_focus_time: u128,
     extra_break_time: u128,
@@ -40,6 +54,8 @@ impl Statistics {
         Statistics {
             focus_time: 0,
             break_time: 0,
+            skipped_focus_time: 0,
+            skipped_break_time: 0,
             paused_time: 0,
             extra_focus_time: 0,
             extra_break_time: 0,
@@ -50,13 +66,15 @@ impl Statistics {
     fn print(&self) {
         let esc_char = 27 as char;
         println!("{esc_char}[2J");
-        println!("{esc_char}[1;1H> Focus:       {}", format_time(self.focus_time).green());
-        println!("{esc_char}[2;1H> Break:       {}", format_time(self.break_time).red());
-        println!("{esc_char}[3;1H> Extra Focus: {}", format_time(self.extra_focus_time).purple());
-        println!("{esc_char}[4;1H> Extra Break: {}", format_time(self.extra_break_time).magenta());
-        println!("{esc_char}[5;1H> Paused:      {}", format_time(self.paused_time).blue());
-        println!("{esc_char}[6;1H> Cycles:      {}", format!("{}", self.completed_cycles).white());
-        println!("{esc_char}[6;1H");
+        println!("{esc_char}[1;1H> Focus:           {}", format_time(self.focus_time).yellow().bold());
+        println!("{esc_char}[2;1H> Break:           {}", format_time(self.break_time).yellow().bold());
+        println!("{esc_char}[4;1H> {} Break:   {}", "Skipped".strikethrough(), format_time(self.skipped_break_time).yellow().bold());
+        println!("{esc_char}[3;1H> {} Focus:   {}", "Skipped".strikethrough(), format_time(self.skipped_focus_time).yellow().bold());
+        println!("{esc_char}[5;1H> {} Focus:     {}", "Extra".bright_white().bold(), format_time(self.extra_focus_time).yellow().bold());
+        println!("{esc_char}[6;1H> {} Break:     {}", "Extra".bright_white().bold(), format_time(self.extra_break_time).yellow().bold());
+        println!("{esc_char}[7;1H> Paused Time:     {}", format_time(self.paused_time).yellow().bold());
+        println!("{esc_char}[8;1H> Full Cycles:     {}", format!("{}", self.completed_cycles).blue().bold());
+        println!("{esc_char}[8;1H");
     }
 }
 
@@ -74,10 +92,10 @@ fn main() {
 
     let esc_char = 27 as char;
     let idle_instruction = format!("Press ({}) to start focusing, ({}) to quit.{esc_char}[1;1H", "S".green(), "Q".red());
-    let running_instruction = format!("Press ({}) to pause, ({}) stop ({}) to quit.{esc_char}[1;1H", "S".yellow(), "E".purple(), "Q".red());
-    let continue_instruction = format!("Press ({}) to continue, Press ({}) to pause, ({}) to quit.{esc_char}[1;1H", "C".blue(), "S".green(), "Q".red());
-    let unpause_instruction = format!("Press ({}) to Un-pause, ({}) to quit.{esc_char}[1;1H", "S".blue(), "Q".red());
-    let mut instruction = idle_instruction.clone();
+    let running_instruction = format!("Press ({}) to pause, ({}) to skip, ({}) to end, ({}) to quit.{esc_char}[1;1H", "P".yellow(), "S".blue(), "E".purple(), "Q".red());
+    let continue_instruction = format!("Press ({}) to continue, Press ({}) to pause, ({}) to quit.{esc_char}[1;1H", "C".blue(), "P".green(), "Q".red());
+    let unpause_instruction = format!("Press ({}) to Resume, ({}) to quit.{esc_char}[1;1H", "R".blue(), "Q".red());
+    let mut instruction = &idle_instruction;
 
     let (_stream, sound_device) = OutputStream::try_default().unwrap();
     let sink = Sink::try_new(&sound_device).unwrap();
@@ -117,25 +135,47 @@ fn main() {
                     match pomo_state {
                         PomodoroState::Idle => {
                             pomo_state = PomodoroState::Running;
-                            instruction = running_instruction.clone();
+                            instruction = &running_instruction;
                             remaining_time = phase_cycle[current_phase_idx].1 * 1000 * 60;
                             sink.skip_one();
                         }
-                        PomodoroState::Paused => {
-                            pomo_state = PomodoroState::Running;
-                            instruction = running_instruction.clone();
+                        PomodoroState::Running => {
+                            current_phase_idx += 1;
+                            if current_phase_idx == phase_cycle.len() {
+                                current_phase_idx = 0;
+                                stats.completed_cycles += 1;
+                            }
+                            remaining_time = phase_cycle[current_phase_idx].1 * 1000 * 60;
+                            sink.skip_one();
                         }
+                        _ => {}
+                    }
+                },
+                termion::event::Key::Char('p') => {
+                    match pomo_state {
                         PomodoroState::Running => {
                             pomo_state = PomodoroState::Paused;
-                            instruction = unpause_instruction.clone();
+                            instruction = &unpause_instruction;
                         }
                         PomodoroState::PendingContinueInput => {
                             pomo_state = PomodoroState::Paused;
-                            instruction = unpause_instruction.clone();
+                            instruction = &unpause_instruction;
                             sink.skip_one();
                         }
+                        _ => {}
                     }
-                },
+                }
+                termion::event::Key::Char('r') => {
+                    if pomo_state == PomodoroState::Paused {
+                        if remaining_time > 0 {
+                            pomo_state = PomodoroState::Running;
+                            instruction = &running_instruction;
+                        } else {
+                            pomo_state = PomodoroState::PendingContinueInput;
+                            instruction = &continue_instruction;
+                        }
+                    }
+                }
                 termion::event::Key::Char('c') => {
                     if pomo_state == PomodoroState::PendingContinueInput {
                         pomo_state = PomodoroState::Running;
@@ -144,7 +184,7 @@ fn main() {
                             current_phase_idx = 0;
                             stats.completed_cycles += 1;
                         }
-                        instruction = running_instruction.clone();
+                        instruction = &running_instruction;
                         remaining_time = phase_cycle[current_phase_idx].1 * 1000 * 60;
                         sink.skip_one();
                     }
@@ -152,7 +192,8 @@ fn main() {
                 termion::event::Key::Char('e') => {
                     if pomo_state == PomodoroState::Running || pomo_state == PomodoroState::Paused {
                         pomo_state = PomodoroState::Idle;
-                        instruction = idle_instruction.clone();
+                        current_phase_idx = 0;
+                        instruction = &idle_instruction;
                         sink.skip_one();
                     }
                 },
@@ -181,7 +222,7 @@ fn main() {
                 // changing state, playing sound.
                 if pomo_state != PomodoroState::PendingContinueInput {
                     pomo_state = PomodoroState::PendingContinueInput;
-                    let sound_to_play = if current_phase_idx % 2 != 0 {
+                    let sound_to_play= if current_phase_idx % 2 != 0 {
                         audio_source_motiv.clone()
                     } else {
                         audio_source_break.clone()
@@ -193,7 +234,7 @@ fn main() {
                 } else {
                     stats.extra_break_time += elapsed_in_loop as u128;
                 }
-                instruction = continue_instruction.clone();
+                instruction = &continue_instruction;
                 colored_duration_str = duration_str.red();
             }
 
@@ -215,6 +256,6 @@ fn main() {
             println!("{esc_char}[2;1H{colored_duration_str} {current_phase_str}{esc_char}[2;1H");
         }
 
-        sleep(Duration::from_millis(10));
+        sleep(Duration::from_millis(16));
     }
 }
